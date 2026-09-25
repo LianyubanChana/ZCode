@@ -1,0 +1,183 @@
+# =============================================================================
+# ZCode -> Windows 7 x64  构建流水线（GitHub Actions）
+# -----------------------------------------------------------------------------
+# 适用场景：手边没有任何 Windows 10/11 机器。
+# GitHub 免费提供 Windows Server 2022 runner（公开仓库无限额；私有仓库
+# 每月 2000 分钟免费额度，一次完整构建约 20-40 分钟，够用）。
+#
+# 前置准备 —— 网页版（不需要 git，推荐；逐步说明见 build/ROUTE-A-CHECKLIST.md）
+#   0. 先在本机跑一次，生成单文件载荷：
+#        powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-github-fork.ps1
+#      产出 G:\zcode-win7\fork-staging\ 下的 win7-bundle.json、build-win7.yml、
+#      build-win7.gbk.yml（GBK，Win7 记事本可直接打开）
+#   1. 在 GitHub 上 fork https://github.com/zai-org/ZCode
+#   2. fork 里 Add file -> Upload files -> **只拖入 win7-bundle.json 这一个文件** -> Commit
+#      （GitHub 网页上传不支持文件夹：拖目录会丢结构，点开头的目录还会被整块跳过）
+#   3. fork 里 Add file -> Create new file -> 文件名框里直接输入
+#        .github/workflows/build-win7.yml
+#      GitHub 会按路径自动创建缺失目录；内容粘贴 build-win7.gbk.yml
+#   4. Actions -> Build ZCode for Windows 7 -> Run workflow -> 下载 ZCode-win7-x64
+#
+# 前置准备 —— 命令行版（装了 git 更省事）
+#   1. git clone https://github.com/<你的用户名>/ZCode.git && cd ZCode
+#   2. xcopy /E /I /Y G:\zcode-win7  .win7
+#   3. mkdir .github\workflows
+#      copy G:\zcode-win7\build\github-actions-win7.yml  .github\workflows\build-win7.yml
+#   4. git add -A && git commit -m "win7 port" && git push
+#   5. Actions -> Run workflow
+#      这条路径没有 win7-bundle.json，下面的 Unpack 步骤会自动跳过。
+#
+# 产物：
+#   ZCode-win7-x64/ZCode Setup 3.14.3.exe        NSIS 安装包
+#   ZCode-win7-x64/win-unpacked/                 免安装目录（冒烟首选）
+# =============================================================================
+
+name: Build ZCode for Windows 7
+
+on:
+  workflow_dispatch:
+    inputs:
+      electron_version:
+        description: "Electron 版本（Win7 上限 22.3.27）"
+        required: false
+        default: "22.3.27"
+      enable_background:
+        description: "是否启用背景主题"
+        required: false
+        default: "true"
+  push:
+    tags:
+      - "win7-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 必须用 Windows runner：原生模块（node-pty）要在 Windows 上用 MSVC 重编，
+    # 从 Linux 交叉编译出不了 .node 二进制。
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      CI: "true"
+      # GitHub runner 访问 github.com 很快，默认不启用国内镜像。
+      # 若 Electron 下载超时，取消下面两行注释即可切到 npmmirror：
+      # ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+      # ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install Node.js 24.14.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+
+      # 移植包是以单个 win7-bundle.json 上传的（GitHub 网页上传不支持文件夹，
+      # 拖目录会丢结构、点开头的目录还会被跳过）。这里用内联 node 还原成 .win7/ 目录树。
+      # 如果你是用 git 直接提交整棵 .win7/ 目录的，这一步会自动跳过。
+      - name: Unpack Windows 7 port bundle
+        shell: bash
+        run: |
+          if [ -f win7-bundle.json ]; then
+            node -e "const fs=require('fs'),p=require('path');const b=JSON.parse(fs.readFileSync('win7-bundle.json','utf8'));const root=b.root||'.win7';let n=0;for(const k of Object.keys(b.files)){const d=p.join(root,k);fs.mkdirSync(p.dirname(d),{recursive:true});fs.writeFileSync(d,Buffer.from(b.files[k],'base64'));n++;}console.log('unpacked '+n+' files -> '+root+'/')"
+            ls -la .win7
+          else
+            echo "::warning::win7-bundle.json not found; assuming .win7/ already exists in the repo"
+          fi
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          node -v
+          pnpm -v
+          git --version
+          ls .win7/scripts || true
+
+      # 先套用 Win7 移植，再安装 —— 顺序很重要：
+      # 改完 package.json 后第一次安装就直接拉 Electron 22，省掉一轮全量重装。
+      - name: Apply Windows 7 port
+        shell: bash
+        run: |
+          node .win7/scripts/apply-win7-port.mjs --repo .             # 预演，改动清单留档
+          node .win7/scripts/apply-win7-port.mjs --repo . --apply
+        timeout-minutes: 10
+
+      - name: Deploy background art (optional)
+        if: ${{ github.event.inputs.enable_background != 'false' }}
+        shell: bash
+        run: |
+          mkdir -p packages/desktop/src/renderer/public/theme
+          SRC=""
+          if [ -f .win7/assets/zcode-bg.jpg ]; then SRC=.win7/assets/zcode-bg.jpg; fi
+          if [ -z "$SRC" ] && [ -f .win7/theme/zcode-bg.jpg ]; then SRC=.win7/theme/zcode-bg.jpg; fi
+          if [ -n "$SRC" ]; then
+            cp "$SRC" packages/desktop/src/renderer/public/theme/zcode-bg.jpg
+            echo "background art deployed from $SRC"
+          else
+            echo "::warning::no zcode-bg.jpg in .win7/assets or .win7/theme - background disabled"
+          fi
+
+      # bootstrap = 安装 workspace 依赖 + 准备桌面运行资源 + 构建各包
+      - name: Bootstrap workspace
+        shell: bash
+        run: pnpm bootstrap
+        timeout-minutes: 150
+
+      # 原生模块按 Electron 22 的 ABI（110 / Node 16）重编
+      - name: Rebuild native modules for Electron 22
+        shell: bash
+        run: pnpm --filter @zcode/desktop run win7:rebuild
+        timeout-minutes: 30
+        continue-on-error: true # node-pty 在 Win7 无 ConPTY，失败也不阻断打包
+
+      - name: Bundle desktop (Windows x64)
+        shell: bash
+        run: pnpm bundle:desktop -- --os win --arch x64
+        timeout-minutes: 90
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p out/ZCode-win7-x64
+          cp -r packages/desktop/dist/win-unpacked out/ZCode-win7-x64/ 2>/dev/null || true
+          cp packages/desktop/dist/*.exe out/ZCode-win7-x64/ 2>/dev/null || true
+          ls -lh out/ZCode-win7-x64
+
+      - name: Verify background assets are inside the app
+        shell: bash
+        run: |
+          cd packages/desktop/dist/win-unpacked
+          npx --yes @electron/asar list resources/app.asar > asar.txt
+          grep -q "out/renderer/theme/zcode-bg.css" asar.txt \
+            && echo "OK: theme css packaged" \
+            || echo "::warning::theme css NOT packaged"
+          grep -q "out/renderer/theme/zcode-bg.jpg" asar.txt \
+            && echo "OK: background image packaged" \
+            || echo "::warning::background image NOT packaged"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZCode-win7-x64
+          path: out/ZCode-win7-x64/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Print smoke test notes
+        shell: bash
+        run: |
+          echo "下载产物后，在 Windows 7 SP1 x64 上："
+          echo "  ZCode.exe --enable-logging --v=1"
+          echo "期望日志： [zcode-win7] OS=6.1.7601 electron=22.3.27 chrome=108 node=16.17.1"
