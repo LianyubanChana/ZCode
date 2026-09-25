@@ -143,6 +143,47 @@ jobs:
         run: pnpm bootstrap
         timeout-minutes: 150
 
+      # CSS 降级依赖 lightningcss。这里不锁版本地安装，避免写进 package.json 后
+      # 因版本号不存在而在 Sync lockfile 阶段失败。插件在其缺失时只警告不阻断，
+      # 所以这一步失败也不会让构建中断（只是 CSS 不降级）。
+      - name: Install CSS downleveler
+        shell: bash
+        run: pnpm --filter @zcode/desktop add -D lightningcss || echo "::warning::lightningcss install failed; CSS will not be downgraded"
+        timeout-minutes: 15
+        continue-on-error: true
+
+      # 上一步报过 "SyntaxError: Unexpected token '{'"（载入 vite.config.ts 失败）。
+      # 这种错误要到 Bundle 阶段才暴露，代价是白等 10 分钟。
+      # 这里在打包前做两项低成本校验：插件模块可加载、vite 配置可被 Vite 解析。
+      # 注意：不能用 new Function() 解析含 import 的 ESM，必然误报。
+      - name: Validate Win7 patches
+        shell: bash
+        run: |
+          cd packages/desktop
+          echo "--- 1) CSS plugin module loads ---"
+          node -e "import('./scripts/win7-css-target.mjs').then(function(m){if(typeof m.zcodeWin7CssTarget!=='function'){console.error('zcodeWin7CssTarget export missing');process.exit(1)}console.log('CSS plugin OK')}).catch(function(e){console.error(e);process.exit(1)})"
+          echo "--- 2) vite.config.ts is loadable by Vite ---"
+          node -e "
+            (async function () {
+              const { loadConfigFromFile } = await import('vite');
+              const res = await loadConfigFromFile(
+                { command: 'build', mode: 'production' },
+                'vite.config.ts',
+                process.cwd()
+              );
+              if (!res) { console.error('loadConfigFromFile returned null'); process.exit(1); }
+              const cfg = typeof res.config === 'function' ? res.config({ command: 'build', mode: 'production' }) : res.config;
+              const names = ((cfg && cfg.plugins) || []).flat(Number.MAX_VALUE).map(function (p) { return p && p.name; }).filter(Boolean);
+              console.log('plugins:', names.join(', '));
+              if (names.indexOf('zcode:win7-css-target') < 0) {
+                console.error('zcode:win7-css-target NOT registered');
+                process.exit(1);
+              }
+              console.log('vite.config.ts OK, win7 css plugin registered');
+            })().catch(function (e) { console.error(e); process.exit(1); });
+          "
+        timeout-minutes: 10
+
       # 原生模块按 Electron 22 的 ABI（110 / Node 16）重编
       - name: Rebuild native modules for Electron 22
         shell: bash
